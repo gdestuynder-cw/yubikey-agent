@@ -6,6 +6,9 @@
 
 **skoob-agent** is a seamless SSH agent for YubiKeys, forked from [yubikey-agent](https://github.com/FiloSottile/yubikey-agent) and customized for CoreWeave.
 
+![skoob-agent](https://github.com/user-attachments/assets/8ee1def1-46ac-41e2-9cfa-12b63c0596c3)
+
+
 ## What's Different
 
 This fork includes the following changes from the original yubikey-agent:
