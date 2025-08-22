@@ -1,4 +1,4 @@
-module filippo.io/yubikey-agent
+module github.com/coreweave/skoob-agent
 
 go 1.23.0
 

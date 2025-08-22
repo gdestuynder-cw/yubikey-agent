@@ -8,11 +8,11 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
+	_ "embed"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,18 +33,97 @@ import (
 	"github.com/go-piv/piv-go/v2/piv"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
+
+//go:embed skoob.png
+var skoobIcon []byte
+
+// Build information - can be set via ldflags
+var (
+	version   = "unknown"
+	buildTime = "unknown"
+	buildHash = "unknown"
+)
+
+func getVersion() string {
+	// Use version set at build time via ldflags
+	if version != "unknown" {
+		return "v" + version
+	}
+	
+	// Fallback: try to load version from VERSION file (for development)
+	if file, err := os.Open("VERSION"); err == nil {
+		defer file.Close()
+		if versionBytes, err := io.ReadAll(file); err == nil {
+			return "v" + strings.TrimSpace(string(versionBytes))
+		}
+	}
+	return "unknown"
+}
+
+func getBuildInfo() string {
+	version := getVersion()
+	result := version
+	
+	// Add build time if available
+	if buildTime != "unknown" {
+		result += " (built " + buildTime + ")"
+	}
+	
+	// Add git hash if available
+	if buildHash != "unknown" {
+		result += " [" + buildHash + "]"
+	}
+	
+	// Try to get additional build info from Go
+	if buildInfo, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range buildInfo.Settings {
+			if setting.Key == "vcs.revision" && buildHash == "unknown" {
+				if len(setting.Value) > 7 {
+					result += " [" + setting.Value[:7] + "]"
+				} else {
+					result += " [" + setting.Value + "]"
+				}
+				break
+			}
+		}
+	}
+	
+	return result
+}
+
+func getBuildHashForTitle() string {
+	// Return just the build hash in brackets for dialog titles
+	if buildHash != "unknown" {
+		return "[" + buildHash + "]"
+	}
+	
+	// Try to get from Go build info if not set via ldflags
+	if buildInfo, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range buildInfo.Settings {
+			if setting.Key == "vcs.revision" {
+				if len(setting.Value) > 7 {
+					return "[" + setting.Value[:7] + "]"
+				} else {
+					return "[" + setting.Value + "]"
+				}
+			}
+		}
+	}
+	
+	return ""
+}
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage of yubikey-agent:\n")
+		fmt.Fprintf(os.Stderr, "Usage of skoob-agent:\n")
 		fmt.Fprintf(os.Stderr, "\n")
-		fmt.Fprintf(os.Stderr, "\tyubikey-agent -setup\n")
+		fmt.Fprintf(os.Stderr, "\tskoob-agent -setup\n")
 		fmt.Fprintf(os.Stderr, "\n")
 		fmt.Fprintf(os.Stderr, "\t\tGenerate a new SSH key on the attached YubiKey.\n")
 		fmt.Fprintf(os.Stderr, "\n")
-		fmt.Fprintf(os.Stderr, "\tyubikey-agent -l PATH\n")
+		fmt.Fprintf(os.Stderr, "\tskoob-agent -l PATH\n")
 		fmt.Fprintf(os.Stderr, "\n")
 		fmt.Fprintf(os.Stderr, "\t\tRun the agent, listening on the UNIX socket at PATH.\n")
 		fmt.Fprintf(os.Stderr, "\n")
@@ -76,15 +156,17 @@ func main() {
 }
 
 func runAgent(socketPath string) {
-	if terminal.IsTerminal(int(os.Stdin.Fd())) {
-		log.Println("Warning: yubikey-agent is meant to run as a background daemon.")
+	log.Printf("Starting skoob-agent %s", getBuildInfo())
+	
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		log.Println("Warning: skoob-agent is meant to run as a background daemon.")
 		log.Println("Running multiple instances is likely to lead to conflicts.")
 		log.Println("Consider using the launchd or systemd services.")
 	}
 
 	a := &Agent{}
 
-	c := make(chan os.Signal)
+	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGHUP)
 	go func() {
 		for range c {
@@ -122,11 +204,6 @@ type Agent struct {
 	mu     sync.Mutex
 	yk     *piv.YubiKey
 	serial uint32
-
-	// touchNotification is armed by Sign to show a notification if waiting for
-	// more than a few seconds for the touch operation. It is paused and reset
-	// by getPIN so it won't fire while waiting for the PIN.
-	touchNotification *time.Timer
 }
 
 var _ agent.ExtendedAgent = &Agent{}
@@ -216,12 +293,52 @@ func (a *Agent) Close() error {
 	return nil
 }
 
-func (a *Agent) getPIN() (string, error) {
-	if a.touchNotification != nil && a.touchNotification.Stop() {
-		defer a.touchNotification.Reset(5 * time.Second)
+func getEmbeddedIconPath() (string, func()) {
+	// Create a secure temporary file for embedded icon
+	if len(skoobIcon) == 0 {
+		return "", func() {}
 	}
+	
+	// Create temp file with restrictive permissions
+	tmpFile, err := os.CreateTemp("", "skoob-icon-*.png")
+	if err != nil {
+		log.Printf("DEBUG: Failed to create temp file for icon: %v", err)
+		return "", func() {}
+	}
+	
+	// Set restrictive permissions (owner read-only)
+	if err := tmpFile.Chmod(0400); err != nil {
+		log.Printf("DEBUG: Failed to set temp file permissions: %v", err)
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return "", func() {}
+	}
+	
+	// Write embedded icon data to temp file
+	if _, err := tmpFile.Write(skoobIcon); err != nil {
+		log.Printf("DEBUG: Failed to write icon data: %v", err)
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return "", func() {}
+	}
+	
+	tmpFile.Close()
+	
+	// Return cleanup function
+	cleanup := func() {
+		os.Remove(tmpFile.Name())
+	}
+	
+	return tmpFile.Name(), cleanup
+}
+
+func (a *Agent) getPIN() (string, error) {
 	r, _ := a.yk.Retries()
-	return getPIN(a.serial, r)
+	// Use embedded icon with secure temp file
+	imagePath, cleanup := getEmbeddedIconPath()
+	defer cleanup()
+
+	return getPIN(a.serial, r, imagePath)
 }
 
 func (a *Agent) List() ([]*agent.Key, error) {
@@ -314,18 +431,28 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 			continue
 		}
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		a.touchNotification = time.NewTimer(5 * time.Second)
+		// Show touch prompt and wait for user response before proceeding
+		// Use embedded icon with secure temp file
+		imagePath, cleanup := getEmbeddedIconPath()
+
+		// Show touch prompt in background so it doesn't block signing operation
+		log.Printf("DEBUG: About to show touch prompt for serial %d", a.serial)
 		go func() {
-			select {
-			case <-a.touchNotification.C:
-			case <-ctx.Done():
-				a.touchNotification.Stop()
-				return
+			defer cleanup()
+			log.Printf("DEBUG: Inside touch prompt goroutine")
+			if err := promptTouch(a.serial, imagePath); err != nil {
+				log.Printf("DEBUG: Touch prompt failed: %v", err)
+				// If touch prompt fails, fall back to notification
+				showNotification("Waiting for Key touch...")
+			} else {
+				log.Printf("DEBUG: Touch prompt succeeded")
 			}
-			showNotification("Waiting for YubiKey touch...")
 		}()
+		
+		// Small delay to ensure notification has time to appear
+		log.Printf("DEBUG: Sleeping 100ms for notification display")
+		time.Sleep(100 * time.Millisecond)
+		log.Printf("DEBUG: About to start signing operation")
 
 		alg := key.Type()
 		switch {
@@ -345,10 +472,10 @@ func showNotification(message string) {
 	case "darwin":
 		message = strings.ReplaceAll(message, `\`, `\\`)
 		message = strings.ReplaceAll(message, `"`, `\"`)
-		appleScript := `display notification "%s" with title "yubikey-agent"`
+		appleScript := `display notification "%s" with title "skoob-agent"`
 		exec.Command("osascript", "-e", fmt.Sprintf(appleScript, message)).Run()
 	case "linux":
-		exec.Command("notify-send", "-i", "dialog-password", "yubikey-agent", message).Run()
+		exec.Command("notify-send", "-i", "dialog-password", "skoob-agent", message).Run()
 	}
 }
 

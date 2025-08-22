@@ -1,0 +1,5 @@
+skoob-agent
+yubikey-agent
+test-*
+*.tmp
+*.log

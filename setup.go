@@ -15,10 +15,12 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"os"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/go-piv/piv-go/v2/piv"
@@ -35,6 +37,16 @@ func init() {
 	if Version != "" {
 		return
 	}
+
+	// Try to load version from VERSION file first
+	if file, err := os.Open("VERSION"); err == nil {
+		defer file.Close()
+		if versionBytes, err := io.ReadAll(file); err == nil {
+			Version = "v" + strings.TrimSpace(string(versionBytes))
+			return
+		}
+	}
+
 	if buildInfo, ok := debug.ReadBuildInfo(); ok {
 		Version = buildInfo.Main.Version
 		return
@@ -145,13 +157,8 @@ func runSetup(yk *piv.YubiKey) {
 		log.Fatalln("use --really-delete-all-piv-keys ⚠️")
 	}
 
-	var alg piv.Algorithm
-	if supportsVersion(&version, 5, 7, 0) {
-		// For newer Yubikeys, upgrade the key automatically to Ed25519
-		alg = piv.AlgorithmEd25519
-	} else {
-		alg = piv.AlgorithmEC256
-	}
+	// Always use P256 (EC256) regardless of firmware version, we can add ed25519 later again if it becomes important.
+	alg := piv.AlgorithmEC256
 
 	pub, err := yk.GenerateKey(key, piv.SlotAuthentication, piv.Key{
 		Algorithm:   alg,
@@ -166,10 +173,12 @@ func runSetup(yk *piv.YubiKey) {
 	if err != nil {
 		log.Fatalln("Failed to generate parent key:", err)
 	}
+	// Get full build info for certificate OU
+	buildInfo := getBuildInfo()
 	parent := &x509.Certificate{
 		Subject: pkix.Name{
-			Organization:       []string{"yubikey-agent"},
-			OrganizationalUnit: []string{Version},
+			Organization:       []string{"skoob-agent"},
+			OrganizationalUnit: []string{buildInfo},
 		},
 		PublicKey: priv.Public(),
 	}
@@ -206,7 +215,7 @@ func runSetup(yk *piv.YubiKey) {
 	fmt.Println("🔑 Here's your new shiny SSH public key:")
 	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey))
 	fmt.Println("")
-	fmt.Println("Next steps: ensure yubikey-agent is running via launchd/systemd/...,")
+	fmt.Println("Next steps: ensure skoob-agent is running via launchd/systemd/...,")
 	fmt.Println(`set the SSH_AUTH_SOCK environment variable, and test with "ssh-add -L"`)
 	fmt.Println("")
 	fmt.Println("💭 Remember: everything breaks, have a backup plan for when this YubiKey does.")
